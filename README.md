@@ -1,88 +1,105 @@
 # Credit Risk Agent
 
-A conversational assistant for querying and maintaining a bank's client and loan database in plain language. You ask about clients, loans and payment incidents in English or French. The agent calls database tools, returns the actual figures, and reports each client's risk level, which comes from fixed, auditable rules and not from the language model. Any change to the data (create, update, delete) is held until a human confirms it.
+An LLM agent that answers questions about a bank's client loan portfolio, scores client risk, and can create or update records, with a human confirming every write. The LLM never decides risk. Scores come from a deterministic rule in Python, and the model only queries the database through tools and explains the results.
 
-Built with Python, MySQL and an OpenAI-compatible LLM API. All data used in this project is synthetic.
-
-## How it works
-
-```
-User ──► Agent (LLM + tool calling) ──► Tools ──► MySQL
-                                          │
-                                          └──► Risk rules (risk_model.py)
-```
-
-**LLM (`agent.py`).** The agent uses the OpenAI client, pointed at OpenRouter by default, with the model set through an environment variable. Each question runs in a loop of at most 5 steps: the model either answers or requests a tool, the tool runs, and the result goes back to the model. The system prompt forces the model to call a tool for any question about clients, never invent ids, names or figures, report tool errors as they are, and answer in the user's language.
-
-**Tools (`tools.py`).** The functions the model is allowed to call. Each one maps to a specific operation on the database. The model cannot run arbitrary SQL.
-
-**MySQL (`database.py`, `config.py`).** All access goes through one small layer with parameterized queries. Reads return rows as dictionaries. Writes run as a single transaction and roll back on error. Credentials are read from environment variables.
-
-**Risk rules (`risk_model.py`).** The risk level of a client is computed by deterministic rules applied to payment incidents recorded in the database. The same data always gives the same result, and the LLM never decides or adjusts a score. It only retrieves and explains it. <!-- Add one or two lines here on the actual rules: which incident types count, thresholds, risk levels returned. -->
-
-**Confirmation on writes.** Tools that modify data do not execute directly. They return a pending action with a human-readable description, which is shown to the user. The change runs only if the user approves. If the user declines, the model receives a "cancelled" result and tells the user that nothing was changed. The prompt also forbids the model from claiming a change unless a tool actually returned `created`, `updated` or `deleted`.
-
-The split is deliberate: the LLM handles language and routing, while numbers, scoring and data changes stay in code that can be tested and audited.
+> All data in this repository is **fictional** (`schema.sql`). No real client or bank data is used.
 
 ## Example questions
 
-- *Which clients have payment incidents?*
-- *What is the risk level of client 12, and why?*
-- *Show me all the loans of client 12.*
-- *Create a new Immobilier loan for client 12.* (the agent asks for any missing detail, then waits for your confirmation before writing)
+- "Analyze the risk of client 102."
+- "Who are the 3 riskiest clients?"
+- "Compare clients 102 and 104."
+- "Give me a portfolio summary."
+- "Create a Consommation loan of 12,000 for client 101, 36 months at 5.5%." (asks for confirmation before writing)
 
-Questions in French work the same way.
+The agent answers in the language of the question (English or French).
+
+## Architecture
+
+```
+User ──► Agent (agent.py) ──► LLM (OpenAI-compatible API)
+              │                      │ requests a tool
+              │ ◄────────────────────┘
+              ▼
+        Tools (tools.py) ──► MySQL (database.py)
+              │
+              ├─ read tools ───────► results go back to the LLM
+              ├─ risk tools ───────► rules in risk_model.py
+              └─ write tools ──────► return a Pending change
+                                      └─► human confirms (yes/no) ──► executed
+```
+
+- **Agent loop** (`agent.py`): sends the conversation and tool schemas to the model, runs the tools it requests, and feeds results back. It stops after 5 steps. The system prompt forbids answering from memory, inventing ids or figures, and guessing when no tool fits.
+- **Tools** (`tools.py`): 13 functions with JSON schemas. Errors become plain dicts, never exceptions.
+  - Read: `get_client`, `search_clients`, `get_client_credits`, `get_payment_history`
+  - Risk: `calculate_client_risk`, `get_highest_risk_clients`, `compare_clients`, `get_portfolio_summary`
+  - Write: `create_client`, `update_client`, `create_credit`, `update_credit`, `create_payment_incident`, `delete_credit`
+- **Database** (`database.py`): one connection per call through a context manager, parameterized queries only, rollback on error.
+- **Write safety**: a write tool does not touch the database. It returns a `Pending` object describing the change (for updates, old value -> new value). The change runs only if the user confirms. Input is validated first (dates, positive numbers, ENUM values checked against MySQL). A loan with payment incidents cannot be deleted.
+
+## Risk rules
+
+The score depends only on the **number of payment incidents across all of a client's loans** (`risk_model.py`):
+
+| Incidents | Score (max 20) | Level    |
+|-----------|----------------|----------|
+| 0         | 0              | none     |
+| 1-2       | 5              | low      |
+| 3-5       | 10             | moderate |
+| 6 or more | 20             | high     |
+
+Each analysis includes a plain-language explanation built from the rule, not generated by the LLM. `/refresh` in the CLI rebuilds a `Risque` table with every client's score.
 
 ## Setup
 
-**Requirements:** Python 3.10 or later, a running MySQL server, and an API key for an OpenAI-compatible provider such as OpenRouter.
+Requires Python 3.13+, MySQL (or MariaDB), and an API key for any OpenAI-compatible provider (OpenRouter by default).
 
-1. Clone the repository and create a virtual environment.
+```bash
+# 1. Install dependencies
+uv sync                       # or: pip install -r requirements.txt
 
-   ```bash
-   git clone https://github.com/IDER04/Credit-risk-agent.git
-   cd Credit-risk-agent
-   python -m venv .venv
-   source .venv/bin/activate        # Windows: .venv\Scripts\activate
-   ```
+# 2. Configure
+cp .env.example .env          # then fill in DB_PASSWORD, LLM_API_KEY, LLM_MODEL
 
-2. Install the dependencies.
+# 3. Create the database with fictional sample data
+mysql -u root -p < schema.sql
 
-   ```bash
-   pip install -e .
-   ```
+# 4. Run
+python main.py                # CLI, with write confirmation
+streamlit run app.py          # web UI (read-only, see Limitations)
+```
 
-3. Create the database and load the sample data.
+CLI commands: `/refresh` rebuilds the `Risque` table, `/reset` starts a new conversation, `/quit` exits.
 
-   ```bash
-   mysql -u root -p -e "CREATE DATABASE RisqueClt"
-   mysql -u root -p RisqueClt < schema.sql
-   ```
+## Tests
 
-4. Create a `.env` file in the project root.
+```bash
+pip install pytest            # or: uv sync --extra dev
+pytest
+```
 
-   ```env
-   DB_HOST=localhost
-   DB_PORT=3306
-   DB_USER=root
-   DB_PASSWORD=your_password
-   DB_NAME=RisqueClt
-   T_INCIDENT=IncidentPaiement
+- `tests/test_risk_rules.py`: scoring thresholds and explanations. No database needed.
+- `tests/test_tools.py`: tool safety (unknown tools, bad arguments, SQL injection, writes only prepared). Tests marked as database tests are skipped if MySQL is unreachable and expect the sample data from `schema.sql`.
+- `tests/manual/`: smoke scripts that call the real database or LLM (`tools_smoke.py`, `llm_smoke.py`, `agent_smoke.py`). Run them by hand, e.g. `python tests/manual/agent_smoke.py`.
 
-   LLM_API_KEY=your_api_key
-   LLM_BASE_URL=https://openrouter.ai/api/v1
-   LLM_MODEL=your_model_name
-   ```
+## Project structure
 
-   If `DB_PORT` is not set, the code defaults to 8889 (the MAMP default). Set it to match your MySQL server.
+```
+main.py          CLI
+app.py           Streamlit UI
+agent.py         LLM loop, system prompt, confirmation flow
+tools.py         tool functions, validation and JSON schemas
+risk_model.py    scoring rules and explanations
+database.py      MySQL helpers
+config.py        settings from environment variables
+schema.sql       tables and fictional sample data
+tests/           automated tests and manual smoke scripts
+```
 
-5. Run the agent.
+## Limitations and next steps
 
-   ```bash
-   python main.py
-   ```
-
-## Limitations
-
-- The risk level is rule-based. It is not a statistical or machine-learning model.
-- The assistant only knows what the database contains and what its tools can do. If no tool fits a question, it says so instead of guessing.
+- Scoring is rule-based and only counts incidents. It ignores amounts, recency, loan type and repayment history. This is deliberate: the LLM queries and explains, and does not decide.
+- The Streamlit UI has no confirmation step yet, so write requests are cancelled there. Use the CLI for writes.
+- No authentication or per-user permissions. This is a demo, not production banking software.
+- The conversation history is kept in memory only.
+- Next: weight incidents by amount and recency, add confirm buttons to the web UI, and add an evaluation set of questions with expected tool calls.
